@@ -1,0 +1,571 @@
+---
+title: "hPSCs_ATAC"
+output: html_document
+date: "2026-07-20"
+---
+```{r setup, include=FALSE}
+library(ArchR)
+library(Seurat)
+library(GenomicRanges)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(patchwork)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(rtracklayer)
+library(readr)
+
+set.seed(123)
+
+addArchRLocking(locking = TRUE)
+addArchRThreads(threads = 1) 
+addArchRGenome("hg38")
+
+base_path <- "/mnt/data/user/francesco/projects/thesis/hpscs/FC02/ATAC/"
+setwd(paste0(base_path, "ArchR/"))
+
+#MACS2
+reticulate::use_python("/mnt/nvme/home/francesco/.local/share/mamba/envs/mamba_macs2/bin/python3", required = TRUE)
+macs2_path <- "/mnt/nvme/home/francesco/.local/share/mamba/envs/mamba_macs2/bin/macs2"
+```
+
+```{r}
+my_theme <- theme_bw(base_family = "Times New Roman") + 
+  theme(
+    text = element_text(family = "Times New Roman"),
+    axis.text = element_text(size = 9, family = "Times New Roman"),
+    axis.title = element_text(size = 10, family = "Times New Roman"),
+    plot.title = element_text(size = 11, face = "bold", family = "Times New Roman"),
+    legend.text = element_text(size = 10, family = "Times New Roman"),
+    legend.title = element_blank()
+  )
+```
+
+```{r}
+curve <- read_tsv("/mnt/data/user/francesco/projects/scripts/preseq_output/FC02_nuclei_c_curve.txt")
+ggplot(curve, aes(total_reads, distinct_reads)) +
+  geom_line() + theme_minimal() +
+  labs(x = "total reads", y = "distinct reads") + my_theme
+```
+```{r}
+extrap <- read_tsv("/mnt/data/user/francesco/projects/scripts/preseq_output/FC02_nuclei_lc_extrap.txt")
+ggplot(extrap, aes(TOTAL_READS, EXPECTED_DISTINCT)) +
+  geom_ribbon(aes(ymin = LOWER_0.95CI, ymax = UPPER_0.95CI), alpha = 0.15) +
+  geom_line() +
+  theme_minimal()
+```
+
+```{r}
+inputFiles <- c(FC02_nuclei = "/mnt/data/user/francesco/projects/thesis/hpscs/FC02/ATAC/output_ATAC_v3_1/ATAC.frags.sorted.bed.gz")
+```
+
+#use this if an arrow file is already available
+```{r}
+ArrowFiles <- paste0(base_path, "ArchR/ArrowFiles/FC02_nuclei.arrow") 
+```
+
+#make an arrow file
+```{r}
+ArrowFiles <- createArrowFiles(
+  inputFiles = inputFiles,
+  sampleNames = names(inputFiles),
+  minTSS = 4,
+  minFrags = 0, 
+  addTileMat = TRUE,
+  TileMatParams = list(tileSize = 500),
+  addGeneScoreMat = TRUE
+)
+```
+
+#create ArchR project
+```{r}
+proj <- ArchRProject(
+  ArrowFiles = ArrowFiles, 
+  outputDirectory = paste0(base_path, "ArchR"),
+  copyArrows = FALSE
+)
+
+# Barcode Plate Index Linking
+barcodes_file <- read_csv(file.path(base_path, "output.csv"))
+bc_well_values <- sub(".*#", "", rownames(getCellColData(proj)))
+
+proj <- addCellColData(
+  ArchRProj = proj,
+  data = bc_well_values,
+  name = "BC_well",
+  cells = getCellNames(proj),
+  force = TRUE
+)
+
+barcodes_file <- barcodes_file %>%
+  mutate(BC_well = paste(BCset.atac, Well_ID_indexPlate, sep = "_"))
+
+position.atac <- match(proj$BC_well, barcodes_file$BC_well)
+proj$RNA_ATAC_joint_bcs <- barcodes_file$RNA_ATAC_joint_bcs[position.atac]
+proj$XC_DNBPE.rna       <- barcodes_file$XC_DNBPE.rna[position.atac]
+proj$Well_ID_indexPlate <- barcodes_file$Well_ID_indexPlate[position.atac]
+proj$plate_col          <- gsub("[A-Z]", "", proj$Well_ID_indexPlate)
+proj$plate_row          <- gsub("[0-9]+", "", proj$Well_ID_indexPlate)
+
+# Condition assignment
+proj$condition <- case_when(
+  proj$RNA_ATAC_joint_bcs == "21J_5B" ~ "unstained",
+  proj$RNA_ATAC_joint_bcs == "16P_6D" ~ "stained",
+  TRUE                                ~ NA_character_
+)
+
+proj <- proj[!is.na(proj$condition), ]
+```
+
+```{r}
+Xpress.dgecounts <- readRDS("/mnt/data/user/francesco/projects/thesis/hpscs/FC02/SS3X/zUMIs/zUMIs_output/expression/Xpress.dgecounts.rds")
+seurat_obj <- CreateSeuratObject(counts = Xpress.dgecounts$readcount$inex$all)
+seurat_obj$XC_DNBPE.rna <- colnames(seurat_obj)
+
+position.rna <- match(seurat_obj$XC_DNBPE.rna, barcodes_file$XC_DNBPE.rna)
+seurat_obj$RNA_ATAC_joint_bcs <- barcodes_file$RNA_ATAC_joint_bcs[position.rna]
+seurat_obj <- subset(seurat_obj, subset = !is.na(RNA_ATAC_joint_bcs))
+
+seurat_obj$condition <- case_when(
+  seurat_obj$RNA_ATAC_joint_bcs == "21J_5B" ~ "unstained",
+  seurat_obj$RNA_ATAC_joint_bcs == "16P_6D" ~ "stained",
+  TRUE                                ~ NA_character_
+)
+seurat_obj$sample <- "nuclei"
+
+# Convert ENSEMBL to Gene Symbol
+gene_map <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = rownames(seurat_obj),
+  columns = "SYMBOL",
+  keytype = "ENSEMBL"
+)
+gene_map <- gene_map[!duplicated(gene_map$ENSEMBL), ]
+new_names <- ifelse(is.na(gene_map$SYMBOL), gene_map$ENSEMBL, gene_map$SYMBOL)
+rownames(seurat_obj[["RNA"]]) <- make.unique(new_names)
+
+seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-")
+seurat_obj[["percent.rb"]] <- PercentageFeatureSet(seurat_obj, pattern = "^RPS|^RPL")
+```
+
+```{r}
+max_nFeature   <- 17000
+max_nCount     <- 14000
+max_percent_mt <- 13
+
+VlnPlot(seurat_obj, features = "nCount_RNA", log = TRUE,
+        group.by = "sample" ) +
+  geom_hline(yintercept = max_nCount, color = "red", linetype = "dashed", linewidth = 0.7)
+
+VlnPlot(seurat_obj, features = "nFeature_RNA", 
+        group.by = "sample") +
+  geom_hline(yintercept = max_nFeature, color = "red", linetype = "dashed", linewidth = 0.7)
+
+VlnPlot(seurat_obj, features = "percent.mt", 
+        group.by = "sample") +
+  geom_hline(yintercept = max_percent_mt, color = "red", linetype = "dashed", linewidth = 0.7)
+```
+
+```{r}
+# Filtering Single-Cell Dataset
+seurat_obj_filtered <- subset(
+  seurat_obj,
+subset =
+(sample == "nuclei" & nFeature_RNA > 4000 & nFeature_RNA < 17000 & nCount_RNA > 10000 & percent.mt < 13)
+)
+
+# SCTransform & Dimensionality Reduction
+seurat_obj_filtered <- SCTransform(
+  seurat_obj_filtered,
+  assay = "RNA",
+  vst.flavor = "v2",
+  vars.to.regress = c("percent.mt", "percent.rb"),
+  variable.features.n = 3000,
+  verbose = FALSE
+) %>% 
+  RunPCA()
+
+Seurat::ElbowPlot(seurat_obj_filtered, ndims = 50, reduction = "pca")
+```
+
+
+```{r}
+seurat_obj_filtered <- FindNeighbors(seurat_obj_filtered, dims = 1:20) %>% 
+  FindClusters(resolution = 0.3) %>% 
+  RunUMAP(dims = 1:20)
+
+# Map RNA Clusters into ArchR Project
+rna_clusters <- as.character(seurat_obj_filtered$seurat_clusters)
+names(rna_clusters) <- colnames(seurat_obj_filtered)
+rna_clusters_aligned <- rna_clusters[proj$XC_DNBPE.rna]
+
+proj <- addCellColData(
+  ArchRProj = proj,
+  data = rna_clusters_aligned,
+  name = "RNA_Clusters",
+  cells = getCellNames(proj),
+  force = TRUE
+)
+```
+
+```{r}
+# LSI on Tile Matrix
+proj <- addIterativeLSI(
+  ArchRProj = proj, 
+  useMatrix = "TileMatrix", 
+  name = "IterativeLSI_Tile", 
+  iterations = 2,
+  clusterParams = list(resolution = c(0.5)), 
+  varFeatures = 25000,
+  dimsToUse = 2:30,
+  force = TRUE
+) %>% 
+  addClusters(reducedDims = "IterativeLSI_Tile", method = "Seurat", name = "TileClusters", resolution = 0.5, force = TRUE) %>% 
+  addUMAP(reducedDims = "IterativeLSI_Tile", name = "UMAP_Tile", force = TRUE)
+```
+
+
+```{r}
+# Peak Calling via MACS2 on clusters
+proj <- addGroupCoverages(
+  ArchRProj = proj, 
+  groupBy = "TileClusters",
+  force = TRUE
+)
+
+proj <- addReproduciblePeakSet(
+  ArchRProj = proj, 
+  groupBy = "TileClusters",
+  pathToMacs2 = macs2_path,
+  force = TRUE
+)
+```
+
+```{r}
+peaks <- readRDS("/mnt/data/user/francesco/projects/thesis/hpscs/FC02/ATAC/ArchR/PeakCalls/TileClusters/C1-reproduciblePeaks.gr.rds")
+proj <- addPeakSet(ArchRProj = proj, peakSet = peaks, force = TRUE)
+```
+
+```{r}
+proj <- addPeakMatrix(proj)
+
+# LSI on Peak Matrix
+proj <- addIterativeLSI(
+  ArchRProj = proj, 
+  useMatrix = "PeakMatrix", 
+  name = "IterativeLSI_Peak", 
+  iterations = 2,
+  clusterParams = list(resolution = c(0.3)), 
+  varFeatures = 25000,
+  dimsToUse = 2:30,
+  force = TRUE
+) %>% 
+  addClusters(reducedDims = "IterativeLSI_Peak", method = "Seurat", name = "PeakClusters", resolution = 0.3, force = TRUE) %>% 
+  addUMAP(reducedDims = "IterativeLSI_Peak", name = "UMAP_Peak", force = TRUE)
+
+ATAC_umap_peaks <- plotEmbedding(proj, embedding = "UMAP_Peak", colorBy = "cellColData", name = "PeakClusters", size = 0.8, baseSize = 20, alpha=0.6, labelMeans = FALSE) + 
+  theme_ArchR() + 
+  labs(title = "UMAP of hiPSC nuclei based on chromatin\naccessibility (PeakMatrix)") +
+ my_theme
+
+ATAC_umap_condition_peaks <- plotEmbedding(ArchRProj = proj, embedding = "UMAP_Peak", colorBy = "cellColData", name = "condition", size = 0.8, baseSize = 20, alpha=0.6, labelMeans = FALSE) + 
+  theme_ArchR() + 
+  labs(title = "UMAP of hiPSC nuclei based on chromatin\naccessibility (PeakMatrix)", subtitle="Coloured by staining condition") +
+  my_theme
+
+ggsave(
+  filename = "Plot-UMAP-Clusters_peaks.png", 
+  plot = ATAC_umap_peaks, 
+  width = 8, 
+  height = 6, 
+  units = "in"
+)
+ggsave(
+  filename = "Plot-UMAP-Clusters_condition_peaks.png", 
+  plot = ATAC_umap_condition_peaks, 
+  width = 8, 
+  height = 6, 
+  units = "in"
+)
+```
+
+#plotting RNA clusters on ATAC UMAP
+```{r}
+cells_to_keep <- getCellNames(proj)[!is.na(proj$RNA_Clusters)]
+
+proj_RNA <- proj[cells_to_keep, ]
+
+proj_RNA$RNA_Clusters <- paste0("RNA Cluster ", proj_RNA$RNA_Clusters)
+
+ATAC_umap_peaks_RNA <- plotEmbedding(
+  ArchRProj = proj_RNA,
+  embedding = "UMAP_Peak",
+  colorBy = "cellColData",
+  name = "RNA_Clusters",
+  size = 0.8,
+  baseSize = 20,
+  alpha = 0.6,
+  labelMeans = FALSE
+) +
+  theme_ArchR() +
+  labs(
+    title = "UMAP of hiPSC nuclei based on chromatin\naccessibility (PeakMatrix)",
+    subtitle = "Coloured by RNA clusters"
+  ) +
+  my_theme
+
+ggsave(
+  filename = "Plot-UMAP-peaks_RNA.png",
+  plot = ATAC_umap_peaks_RNA,
+  width = 8,
+  height = 6,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+```{r}
+combined_umap <- (ATAC_umap_peaks / ATAC_umap_condition_peaks / ATAC_umap_peaks_RNA) + 
+  plot_annotation(tag_levels = "A") & my_theme
+
+ggsave(
+  filename = "Combined_UMAPs_PeakMatrix.png",
+  plot = combined_umap,
+  width = 6, height = 12, units = "in",
+  dpi = 600, bg = "white"
+)
+```
+
+```{r}
+my_colors <- c(
+  "stained" = "#E64B35",  
+  "unstained" = "#4DBBD5" 
+)
+qc_df <- getCellColData(proj) %>% as.data.frame()
+
+# Custom Violin Function with Group Statistics
+plot_violin <- function(df, metric_col, title_name, target_val = NULL, accept_val = NULL) {
+  stats_df <- df %>%
+    group_by(condition) %>%
+    summarise(
+      med = round(median(.data[[metric_col]], na.rm = TRUE), 3),
+      avg = round(mean(.data[[metric_col]], na.rm = TRUE), 3),
+      y_pos = max(.data[[metric_col]], na.rm = TRUE) * 1.12, 
+      .groups = "drop"
+    ) %>%
+    mutate(label_text = paste0("Med: ", med, "\nAvg: ", avg))
+  
+  p <- ggplot(df, aes(x = condition, y = .data[[metric_col]], fill = condition)) +
+    geom_violin(trim = FALSE, alpha = 0.6) +
+    geom_boxplot(width = 0.12, color = "black", outlier.shape = NA, alpha = 0.8) +
+    stat_summary(fun = mean, geom = "point", shape = 23, size = 3, fill = "yellow") +
+    geom_text(
+      data = stats_df, 
+      aes(x = condition, y = y_pos, label = label_text), 
+      inherit.aes = FALSE, size = 3.3, fontface = "bold", color = "darkblue", vjust = 0 
+    ) +
+    theme_bw() +
+    labs(title = title_name, x = "Staining condition", y = metric_col) +
+    my_theme +
+    scale_fill_manual(values = my_colors) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.2))) + theme(
+      axis.title.x = element_blank(),
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank()
+    )
+  
+  if (!is.null(target_val)) {
+    p <- p + geom_hline(yintercept = target_val, linetype = "dashed", color = "green4", size = 0.9)
+  }
+  if (!is.null(accept_val)) {
+    p <- p + geom_hline(yintercept = accept_val, linetype = "dotted", color = "orange", size = 0.9)
+  }
+  
+  return(p)
+}
+
+p_frip      <- plot_violin(qc_df, "FRIP", "Fraction of Reads in Peaks (FRiP)", target_val = NULL, accept_val = NULL)
+p_tss       <- plot_violin(qc_df, "TSSEnrichment", "TSS Enrichment Score", target_val = NULL)
+p_nfrags    <- plot_violin(qc_df, "nFrags", "Number of Fragments (nFrags)")
+p_blacklist <- plot_violin(qc_df, "ReadsInBlacklist", "Reads in Blacklist")
+p_frag_size <- plotFragmentSizes(ArchRProj = proj, groupBy = "condition") + scale_color_manual(values = my_colors) + my_theme
+
+plots_QC <- (((p_frip | p_tss) / (p_nfrags | p_blacklist)) / p_frag_size) + 
+  plot_annotation(
+    title = "Quality Control Metrics across Staining Conditions",
+    tag_levels = 'A'
+  ) + 
+  plot_layout(guides = "collect") & 
+  theme(
+    plot.title = element_text(size = 18, face = "bold", family = "Times New Roman", hjust = 0.5)
+  )
+
+ggsave(
+  filename = "QC_metrics_violin.png", 
+  plot = plots_QC,
+  width = 10, 
+  height = 12,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+# Peak type distribution by condition
+```{r}
+peakSE <- getMatrixFromProject(ArchRProj = proj, useMatrix = "PeakMatrix")
+peakSet_gr <- getPeakSet(proj)
+
+mat <- assay(peakSE)
+peak_types <- peakSet_gr$peakType
+
+stopifnot(length(peak_types) == nrow(mat))
+
+counts_by_type <- rowsum(as.matrix(mat), group = peak_types)
+frac_by_type <- sweep(counts_by_type, 2, colSums(counts_by_type), "/")
+
+frac_df <- as.data.frame(t(frac_by_type)) %>%
+  rownames_to_column("cell") %>%
+  pivot_longer(-cell, names_to = "peakType", values_to = "fraction") %>%
+  left_join(
+    data.frame(cell = rownames(getCellColData(proj)), condition = getCellColData(proj)$condition),
+    by = "cell"
+  ) %>%
+  filter(!is.na(condition))
+
+summary_df <- frac_df %>%
+  group_by(condition, peakType) %>%
+  summarise(
+    mean_frac = mean(fraction, na.rm = TRUE),
+    sem = sd(fraction, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+barplot <- ggplot(summary_df, aes(x = condition, y = mean_frac, fill = peakType)) +
+  geom_col(width = 0.5, color = "white", linewidth = 0.3) +
+  geom_text(
+    aes(label = scales::percent(mean_frac, accuracy = 1)),
+    position = position_stack(vjust = 0.5),
+    color = "white", size = 3.5, fontface = "bold"
+  ) +
+  scale_fill_manual(values = c(
+    "Promoter" = "#D55E00",
+    "Intronic" = "#0072B2",
+    "Distal"   = "#009E73",
+    "Exonic"   = "#CC79A7"
+  )) +
+  labs(
+    x = NULL, y = "Fraction of accessible signal",
+    title = "Distribution of ATAC signal by genomic feature type",
+    fill = "Peak type"
+  ) +
+  theme_minimal() +
+  my_theme
+ggsave(filename = "./ArchR/Plots/peak_type_distribution.png", plot = barplot, width = 25, height = 15, dpi = 150, units = "cm")
+```
+
+```{r}
+encode_peaks <- import(
+  "/mnt/data/user/francesco/projects/thesis/hpscs/FC02/ATAC/ENCFF321VDH.bed",
+  format = "narrowPeak"
+)
+seqlevelsStyle(encode_peaks) <- "UCSC"
+
+features_list <- SimpleList(
+  "Our_Peaks"    = getPeakSet(proj),
+  "ENCODE_WTC11" = encode_peaks
+)
+
+ArchRBrowser(
+  ArchRProj = proj,
+  features = features_list
+)
+```
+
+#Library complexity curve (from preseq)
+```{r}
+cc <- read.table("/mnt/data/user/francesco/projects/scripts/preseq_output/FC02_nuclei_1_c_curve.txt", header = TRUE, sep = "\t")
+lc <- read.table("/mnt/data/user/francesco/projects/scripts/preseq_output/FC02_nuclei_1_lc_extrap.txt", header = TRUE, sep = "\t")
+
+max_cc_reads <- max(cc$total_reads)
+
+lc_filtered <- lc %>% filter(TOTAL_READS >= max_cc_reads)
+
+lc_curve <- ggplot() +
+  geom_ribbon(data = lc_filtered, 
+              aes(x = TOTAL_READS / 1e6, ymin = LOWER_0.95CI / 1e6, ymax = UPPER_0.95CI / 1e6), 
+              fill = "lightblue", alpha = 0.4) +
+  geom_line(data = cc, 
+            aes(x = total_reads / 1e6, y = distinct_reads / 1e6, color = "Current data (c_curve)"), 
+            size = 1.2) +
+  
+  geom_line(data = lc_filtered, 
+            aes(x = TOTAL_READS / 1e6, y = EXPECTED_DISTINCT / 1e6, color = "Extrapolation (lc_extrap)"), 
+            size = 1, linetype = "dashed") +
+  
+  scale_color_manual(values = c("Current data (c_curve)" = "#1f77b4", 
+                               "Extrapolation (lc_extrap)" = "#ff7f0e")) +
+  labs(
+    title = "Library Complexity and Projection",
+    x = "Total Reads (Millions)",
+    y = "Distinct Reads (Millions)",
+    color = "Curve"
+  ) +
+  my_theme +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+
+ggsave(filename = "/mnt/data/user/francesco/projects/thesis/hpscs/FC02/ATAC/ArchR/Plots/lc_curve.png", plot = lc_curve, width = 20, height = 15, dpi = 200, units = "cm")
+```
+
+# Joint RNA/ATAC visualization
+```{r}
+# Extract GeneScoreMatrix from ArchR
+gene_score_se <- getMatrixFromProject(proj, useMatrix = "GeneScoreMatrix")
+gene_score_mat <- assay(gene_score_se)
+gene_names <- rowData(gene_score_se)$name
+
+# Remove duplicated gene names and align barcodes
+unique_genes <- !duplicated(gene_names)
+gene_score_mat <- gene_score_mat[unique_genes, ]
+rownames(gene_score_mat) <- gene_names[unique_genes]
+colnames(gene_score_mat) <- proj$XC_DNBPE.rna
+
+# Intersect cells surviving filtering in both datasets
+common_cells <- intersect(colnames(gene_score_mat), colnames(seurat_obj_filtered))
+gene_score_mat_common <- gene_score_mat[, common_cells]
+seurat_joint <- subset(seurat_obj_filtered, cells = common_cells)
+
+# Add ATAC GeneScore as a new assay to the Seurat object
+seurat_joint[["ATAC_GeneScore"]] <- CreateAssayObject(counts = gene_score_mat_common)
+
+# Plot RNA expression
+DefaultAssay(seurat_joint) <- "SCT"
+p_rna <- FeaturePlot(seurat_joint, features = c("PODXL", "PTMA"), reduction = "umap", order = TRUE, ncol = 1) & 
+  scale_color_viridis_c(option = "plasma") & 
+  my_theme
+
+# Plot ATAC Gene Activity
+DefaultAssay(seurat_joint) <- "ATAC_GeneScore"
+p_atac <- FeaturePlot(seurat_joint, features = c("PODXL", "PTMA"), reduction = "umap", order = TRUE, ncol = 1) & 
+  scale_color_viridis_c(option = "viridis") & 
+  my_theme
+
+# Combine and save plots
+joint_feature_plot <- (p_rna | p_atac) + plot_annotation(tag_levels = 'A')
+
+ggsave(
+  filename = "Joint_RNA_ATAC_FeaturePlot.png", 
+  plot = joint_feature_plot,
+  width = 10, 
+  height = 10,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+

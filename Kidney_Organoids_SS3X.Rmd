@@ -1,0 +1,1008 @@
+---
+title: "Kidney_organoids_SS3X"
+output: html_document
+date: "2026-07-13"
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r setup, echo=FALSE}
+library(tidyverse)
+library(data.table)
+library(patchwork)
+library(ggsci)
+library(viridis)
+library(flowCore)
+library(ggnewscale)
+```
+
+```{r}
+# Directory in which the zUMIs folder lies
+wd <- "/mnt/data/user/francesco/projects/thesis/kidney_organoids/FC01/SS3X_1/"
+yaml_projectName <- "Xpress"
+# SE or PE sequencing
+seq_type <- "PE" # either "SE" or "PE"
+
+setwd(paste0(wd, "analysis/"))
+```
+
+#Reading Barcodes and zUMIs Results
+```{r}
+# Load barcode metadata
+v4_bcs <- fread("/mnt/nvme/home/constantin/resources/barcodes/CD_SS3X_v4_bc_96w_WellID.txt")
+
+# Reading in readspercell txt file (part of zUMIs output)
+readsPerCell <- fread(paste0(wd, "zUMIs/zUMIs_output/stats/", yaml_projectName, ".readspercell.txt"))
+# Removing all the "bad" quality cells from readsPerCell data table
+readsPerCell <- readsPerCell[!readsPerCell$RG == "bad", ]
+
+# Cast to group by barcode
+grouped.readsPerCell <- dcast(readsPerCell, RG ~ type, value.var = "N", fill = 0)
+colnames(grouped.readsPerCell)[1] <- c("SS3X_Barcode")
+
+# Reading in UMI information
+UMIcounts <- fread(paste0(wd, "zUMIs/zUMIs_output/", yaml_projectName, "kept_barcodes_binned.txt.BCUMIstats.txt"))
+UMIcounts <- as.data.frame(UMIcounts)
+
+if (seq_type == "PE") {
+  UMIcounts <- mutate(UMIcounts, nUMI = nUMItag / 2)
+} else {
+  UMIcounts <- mutate(UMIcounts, nUMI = nUMItag)
+}
+
+colnames(UMIcounts) <- c("SS3X_Barcode", "nUntagged", "nUMItag", "nUMI")
+UMIcounts <- UMIcounts[, c(1, 4)]
+```
+
+```{r}
+table(readsPerCell$type)
+```
+
+#Merging and Processing Stats
+```{r}
+# Combine bcs and grouped.readsPerCell data tables
+v4_bcs <- v4_bcs[, c("XC_DNBPE", "vec96_quadrant", "vec_96w", "BCset", "WellID")]
+names(v4_bcs)[1] <- "SS3X_Barcode"
+combined.stats <- merge(grouped.readsPerCell, v4_bcs, by = "SS3X_Barcode")
+
+# Merge UMIcounts
+combined.stats <- inner_join(combined.stats, UMIcounts, by = "SS3X_Barcode")
+
+# Calculate percentage of genes (Exon + Intron) within reads
+combined.stats <- as.data.table(combined.stats)
+combined.stats <- combined.stats[, nReads := Ambiguity + Exon + Intergenic + Intron + Unmapped][, pct_gene := ((Exon + Intron) / nReads) * 100]
+```
+
+#Defining Metadata, Conditions and Wells
+```{r}
+combined.stats$experiment <- "FC01"
+
+# Assign timestamp based on BCset
+combined.stats <- combined.stats %>%
+  mutate(
+    timestamp = case_when(
+      BCset == "21L"  ~ "D8",
+      BCset == "18M"  ~ "D13",
+      BCset == "18J"  ~ "D8",
+      BCset == "17M"  ~ "D13",
+      BCset == "21J"  ~ "D15",
+      BCset == "21P"  ~ "D18",
+      BCset == "16P"  ~ "D15",
+      BCset == "17L"  ~ "D18",
+      TRUE ~ NA_character_
+    )
+  )
+
+# Assign sample source (cells vs nuclei)
+combined.stats <- combined.stats %>%
+  mutate(
+    sample = case_when(
+      BCset == "21L"  ~ "cells",
+      BCset == "18M"  ~ "cells",
+      BCset == "18J"  ~ "nuclei",
+      BCset == "17M"  ~ "nuclei",
+      BCset == "21J"  ~ "cells",
+      BCset == "21P"  ~ "cells",
+      BCset == "16P"  ~ "nuclei",
+      BCset == "17L"  ~ "nuclei",
+      TRUE ~ NA_character_
+    )
+  )
+
+combined.stats$well_info <- paste(combined.stats$timestamp, combined.stats$sample, sep = "_")
+
+# Add reads division and UMI ratio
+combined.stats <- combined.stats %>%
+  mutate(
+    nUMIBynReads = nUMI / nReads,
+    nReads_divBy1000 = round(nReads / 1000)
+  )
+
+# Save intermediate processing object
+saveRDS(combined.stats, paste0(wd, "analysis/combined.stats.rds"))
+```
+
+#QC Plotting Functions and Visualization
+```{r}
+make_pct_gene_plot_list <- function(data_input, plot_var, color_var, nReads_cutoff, pct_gene_cutoff, filter_data = TRUE, ncol_number, threshold_colors = NULL) {
+  plot_sym <- sym(plot_var)
+  color_sym <- sym(color_var)
+  
+  color_values <- if (is.factor(data_input[[color_var]])) {
+    levels(data_input[[color_var]])
+  } else {
+    sort(unique(data_input[[color_var]]))
+  }
+  
+  npg_colors <- pal_npg()(length(color_values))
+  names(npg_colors) <- color_values
+  
+  make_cutoff_df <- function(cutoff, value_name) {
+    if (length(cutoff) == 1) {
+      df <- data.frame(group = color_values, value = cutoff)
+    } else {
+      df <- data.frame(group = names(cutoff), value = unname(cutoff))
+    }
+    names(df) <- c(color_var, value_name)
+    df
+  }
+  
+  nReads_cutoff_df <- make_cutoff_df(nReads_cutoff, "nReads_cutoff")
+  pct_gene_cutoff_df <- make_cutoff_df(pct_gene_cutoff, "pct_gene_cutoff")
+  
+  if (is.null(threshold_colors)) {
+    threshold_colors <- setNames(c("firebrick", "darkblue")[seq_along(color_values)], color_values)
+  }
+  
+  plot_values_raw <- if (is.factor(data_input[[plot_var]])) {
+    levels(data_input[[plot_var]])
+  } else {
+    unique(data_input[[plot_var]])
+  }
+  plot_values <- plot_values_raw[order(readr::parse_number(as.character(plot_values_raw)))]
+  
+  plot_list <- vector("list", length(plot_values))
+  
+  for (i in seq_along(plot_values)) {
+    plot_chr <- plot_values[i]
+    data <- data_input %>% dplyr::filter(!!plot_sym == plot_chr)
+    groups_present <- unique(data[[color_var]])
+    
+    nReads_sub <- nReads_cutoff_df %>% dplyr::filter(!!color_sym %in% groups_present)
+    pct_gene_sub <- pct_gene_cutoff_df %>% dplyr::filter(!!color_sym %in% groups_present)
+    
+    p <- ggplot(data, aes(x = nReads, y = pct_gene, group = !!color_sym, color = !!color_sym)) +
+      geom_point(size = 3, shape = 20, alpha = 0.45) +
+      scale_x_log10() +
+      scale_color_manual(values = npg_colors, drop = FALSE) + 
+      new_scale_color() +  
+     geom_vline(
+       data = nReads_sub,
+       aes(xintercept = nReads_cutoff, color = !!color_sym),
+       linetype = "dashed", size = 0.8, show.legend = FALSE
+       ) +
+      geom_hline(
+        data = pct_gene_sub,
+        aes(yintercept = pct_gene_cutoff, color = !!color_sym),
+        linetype = "dashed", size = 0.8, show.legend = FALSE
+        ) +
+      scale_color_manual(values = threshold_colors) +  
+      labs(subtitle = plot_chr) +
+      xlab("Number of reads (log10 scale)") + 
+      ylab("percent gene (exon + intron) [%]") +
+      theme_minimal() +
+      theme(
+        text = element_text(family = "Times New Roman"),
+        axis.text = element_text(size = 9, family = "Times New Roman"),
+        axis.title = element_text(size = 10, family = "Times New Roman"),
+        plot.subtitle = element_text(size = 11, face = "bold", hjust = 0.5, family = "Times New Roman"),
+        legend.text = element_text(size = 10, family = "Times New Roman"),
+        legend.title = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        panel.background = element_rect(fill = "grey96", color = NA),
+        panel.border = element_rect(color = "black", fill = NA, linewidth = 0.6)
+      ) +
+      scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, by = 25))
+    
+    plot_list[[i]] <- p
+  }
+  
+  combined_plot_pctGene <- Reduce(`+`, plot_list) +
+    plot_layout(ncol = ncol_number) &
+    theme(legend.position = "right")
+  
+  combined_plot_pctGene <- combined_plot_pctGene +
+    plot_annotation(
+      title = "Number of reads vs % gene",
+      theme = theme(plot.title = element_text(size = 14, face = "bold", hjust = 0, family = "Times New Roman"))
+    )
+  
+  if (filter_data) {
+    filtered_data <- data_input %>%
+      dplyr::left_join(nReads_cutoff_df, by = color_var) %>%
+      dplyr::left_join(pct_gene_cutoff_df, by = color_var) %>%
+      dplyr::filter(nReads >= nReads_cutoff, pct_gene >= pct_gene_cutoff) %>%
+      dplyr::select(-nReads_cutoff, -pct_gene_cutoff)
+    return(list(plot_list = combined_plot_pctGene, filtered_data = filtered_data))
+  } else {
+    return(combined_plot_pctGene)
+  }
+}
+```
+
+```{r}
+pct_gene_plots_sample <- make_pct_gene_plot_list(
+  data_input = combined.stats, 
+  plot_var = "timestamp", 
+  color_var = "sample", 
+  nReads_cutoff =  c(cells = 10000, nuclei = 1500),
+  pct_gene_cutoff = c(cells = 35, nuclei = 25),
+  threshold_colors = c(cells = "red2", nuclei = "blue2"),
+  ncol_number = 2
+)
+
+pct_gene_plots_sample$plot_list
+
+# Save QC Scatter Plots
+ggsave(filename = paste0(wd, "analysis/pct_gene_scatter_sample.png"), plot = pct_gene_plots_sample$plot_list, width = 24, height = 18, dpi = 600, units = "cm")
+```
+
+```{r}
+qc_summary <- combined.stats %>%
+  group_by(well_info) %>%
+  summarise(
+    Mean_nReads = mean(nReads, na.rm = TRUE),
+    Median_nReads = median(nReads, na.rm = TRUE),
+    Max_nReads = max(nReads, na.rm = TRUE),
+    Min_nReads = min(nReads, na.rm = TRUE),
+    Mean_PctGene = mean(pct_gene, na.rm = TRUE),
+    Median_PctGene = median(pct_gene, na.rm = TRUE),
+    Max_PctGene = max(pct_gene, na.rm = TRUE),
+    Min_PctGene = min(pct_gene, na.rm = TRUE),
+    n_wells = n()
+  )
+
+print(qc_summary)
+
+write.csv(qc_summary, file = paste0(wd, "analysis/qc_metrics_summary.csv"), row.names = FALSE)
+
+filtered.stats <- pct_gene_plots_sample$filtered_data
+qc_summary_filtered <- filtered.stats %>%
+  group_by(well_info) %>%
+  summarise(
+    Mean_nReads = mean(nReads, na.rm = TRUE),
+    Median_nReads = median(nReads, na.rm = TRUE),
+    Max_nReads = max(nReads, na.rm = TRUE),
+    Min_nReads = min(nReads, na.rm = TRUE),
+    Mean_PctGene = mean(pct_gene, na.rm = TRUE),
+    Median_PctGene = median(pct_gene, na.rm = TRUE),
+    Max_PctGene = max(pct_gene, na.rm = TRUE),
+    Min_PctGene = min(pct_gene, na.rm = TRUE),
+    n_wells = n()
+  )
+
+print(qc_summary_filtered)
+
+write.csv(qc_summary_filtered, file = paste0(wd, "analysis/qc_metrics_summary_filtered.csv"), row.names = FALSE)
+```
+
+#Downsampling Workflows
+```{r}
+fetch_downsamplings <- function(path_zUMIs, quant = c("exon","inex","intron"), type = c("readcount","umicount")){ 
+  path_vector <- list.files(path = paste0(path_zUMIs,"/zUMIs_output/expression/"), pattern = ".rds", full.names = T)
+  d <- lapply(path_vector, readRDS)
+  lib_names <- gsub(pattern = ".dgecounts.rds", replacement = "", x = as.character(data.frame(strsplit(path_vector, split = "Xpress"), stringsAsFactors = F)[2,]))
+  
+  for(i in 1:length(d) ){
+    rds <- d[[i]]
+    depths <- names(rds[[type]][[quant]]$downsampling)
+    out <- lapply(depths, function(x){
+      dat <- as.matrix(rds[[type]][[quant]]$downsampling[[x]])
+      
+      out_dt <- data.frame(
+        cell = paste0(lib_names[i], "", colnames(dat)),
+        nGenes = colSums(dat > 0),
+        nUMIs = colSums(dat),
+        nReads = as.numeric(gsub(pattern = "downsampled_", replacement = "", x = x)),
+        stringsAsFactors = F
+      )
+      setDT(out_dt)
+      return(out_dt)
+    })
+    out <- rbindlist(out)
+    
+    if(i == 1){
+      downsamp_out <- out
+    } else {
+      downsamp_out <- rbind(downsamp_out, out)
+    }
+  }
+  
+  downsamp_out$type <- type
+  downsamp_out$quant <- quant
+  return(downsamp_out)
+}
+
+make_downsampling <- function(data_input, plot_var, color_var, y_axis_set = T, y_axis_range = c(0,16000), ncol_number, min_cells = 5) {
+  data_input$counter <- 1
+  
+  plot_sym <- sym(plot_var)
+  color_sym <- sym(color_var)
+
+  plot_values_raw <- if (is.factor(data_input[[plot_var]])) {
+    levels(data_input[[plot_var]])
+  } else {
+    unique(data_input[[plot_var]])
+  }
+  plot_values <- plot_values_raw[order(readr::parse_number(as.character(plot_values_raw)))]
+  
+  plot_list <- list()
+  for(i in 1:length(plot_values)) {
+    plot_chr <- plot_values[i]
+    data_sub <- data_input[data_input[[plot_var]] == plot_chr, ]
+    y <- data_sub %>% 
+      group_by(!!color_sym, downsample_size) %>%
+      summarise(mean_nGenes = mean(nGenes),
+                nCells = sum(counter),
+                .groups = "drop")
+    y <- y[y$nCells >= min_cells, ]
+    plot_list[[i]] <- y
+    names(plot_list)[[i]] <- plot_chr
+  }
+  
+  base_theme <- theme_minimal() +
+    theme(
+      text = element_text(family = "Times New Roman"),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.background = element_rect(fill = "grey96", color = NA),
+      panel.grid.minor.x = element_blank(),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.y = element_blank(),
+      axis.text = element_text(size = 9), 
+      axis.title = element_text(size = 10), 
+      plot.subtitle = element_text(size = 11, face = "bold", hjust = 0.5),
+      legend.text = element_text(size = 10),
+      legend.title = element_blank(),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.6)
+    )
+  
+  plot_list_nGenes <- list()
+  plot_list_nCells <- list()
+  
+  for (i in 1:length(plot_list)) {
+    plot_chr <- names(plot_list)[[i]]
+    data_plot <- plot_list[[i]]
+    
+    p <- ggplot(data_plot, aes(x = downsample_size, y = mean_nGenes, group = !!color_sym)) +
+      geom_line(aes(color = !!color_sym), size = 0.4) +
+      geom_point(aes(color = !!color_sym), size = 1.2, alpha = 0.5) + 
+      scale_color_viridis_d(option = "viridis") +
+      labs(y = "Mean number of Genes", x = "Number of reads", subtitle = plot_chr) +
+      base_theme
+    
+    if (y_axis_set) {
+      p <- p + scale_y_continuous(limits = y_axis_range, breaks = seq(y_axis_range[1], y_axis_range[2], by = 2000))
+    }
+    
+    p1 <- ggplot(data_plot, aes(x = downsample_size, y = nCells, group = !!color_sym)) +
+      geom_line(aes(color = !!color_sym), size = 0.4) +
+      geom_point(aes(color = !!color_sym), size = 1.2, alpha = 0.5) +
+      scale_color_viridis_d(option = "viridis") +
+      labs(y = "Number of Cells", x = "Number of reads", subtitle = plot_chr) +
+      base_theme
+    
+    plot_list_nGenes[[i]] <- p
+    plot_list_nCells[[i]] <- p1
+  }
+  
+  grid_nGenes <- Reduce(`+`, plot_list_nGenes) + plot_layout(ncol = ncol_number)
+  grid_nCells <- Reduce(`+`, plot_list_nCells) + plot_layout(ncol = ncol_number)
+
+  return(list(nGenes = grid_nGenes, nCells = grid_nCells))
+}
+
+combine_downsampling_plots <- function(grid_nGenes, grid_nCells, min_cells = 5) {
+  
+  header <- function(label) {
+    ggplot() +
+      annotate("text", x = 0, y = 0, label = label, hjust = 0, size = 4.2, fontface = "bold", family = "Times New Roman") +
+      xlim(0, 1) + ylim(-1, 1) +
+      theme_void() +
+      theme(plot.margin = margin(t = 4, b = 2, l = 4, unit = "pt"))
+  }
+  
+  divider <- ggplot() +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey40", linewidth = 0.6) +
+    theme_void() +
+    theme(plot.margin = margin(t = 6, b = 6, unit = "pt"))
+  
+  combined <- header("Mean number of Genes") / grid_nGenes / divider / header("Number of Cells") / grid_nCells +
+    plot_layout(heights = c(0.05, 1, 0.03, 0.05, 1))
+  
+  combined <- combined +
+    plot_annotation(
+      title = paste0("Downsampling trends, min.cells=", min_cells),
+      theme = theme(plot.title = element_text(size = 15, face = "bold", hjust = 0, family = "Times New Roman"))
+    )
+  
+  return(combined)
+}
+```
+
+```{r}
+downsample_perCell <- fetch_downsamplings(path_zUMIs = paste0(wd, "zUMIs/"), quant = "exon", type = "readcount")
+
+combined.downsampling <- inner_join(x = downsample_perCell, y = combined.stats, by = c("cell" = "SS3X_Barcode"))
+colnames(combined.downsampling)[4] <- "downsample_size"
+```
+
+```{r}
+downsample_plots_timestamp <- make_downsampling(
+  data_input = combined.downsampling, 
+  plot_var = "timestamp", 
+  color_var = "sample", 
+  ncol_number = 2, 
+  min_cells = 5
+)
+
+downsample_combined <- combine_downsampling_plots(
+  downsample_plots_timestamp$nGenes,
+  downsample_plots_timestamp$nCells
+)
+
+downsample_combined
+
+ggsave(filename = paste0(wd, "analysis/downsampling_combined.png"), plot = downsample_combined, 
+       width = 24, height = 32, dpi = 600, units = "cm")
+```
+```{r}
+summary_downsampling <- combined.downsampling %>%
+  dplyr::mutate(counter = 1) %>%
+  group_by(timestamp, sample, downsample_size) %>%
+  summarise(
+    mean_nGenes = mean(nGenes),
+    median_nGenes = median(nGenes),
+    nCells = sum(counter),
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(nCells >= 5)
+
+print(summary_downsampling, n = 50)
+
+write.csv(summary_downsampling, paste0(wd, "analysis/downsampling_summary_table.csv"), row.names = FALSE)
+```
+
+#UMI Fractions and Read Composition
+```{r}
+combined.stats <- combined.stats %>%
+  mutate(
+    timestamp = factor(timestamp, levels = c("D8", "D13", "D15", "D18"))
+  )
+
+plot_list_umi <- list()
+experiments <- unique(combined.stats$experiment)
+
+for (i in seq_along(experiments)) {
+  experiment_chr <- experiments[i]
+  data_sub <- combined.stats %>% dplyr::filter(experiment == experiment_chr)
+  
+  p <- ggplot(data_sub, aes(x = timestamp, y = nUMIBynReads, color = sample)) +
+   geom_violin(
+      position = position_dodge(width = 0.8), 
+      width = 0.7, 
+      alpha = 0.2, 
+      trim = FALSE
+    ) +
+   geom_boxplot(
+      position = position_dodge(width = 0.8), 
+      width = 0.2, 
+      outlier.shape = NA,
+      alpha = 0.8
+    ) +
+    scale_color_lancet() +
+    labs(title= "UMI fraction distribution per timestamp",
+      x = NULL, 
+      y = "UMI fraction"
+    ) +
+    scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.25)) +
+    theme_minimal() +
+    theme(
+      text        = element_text(family = "Times New Roman"),
+      plot.title = element_text(size = 15, family = "Times New Roman", face = "italic"),
+      axis.title  = element_text(size = 12, family = "Times New Roman"),
+      axis.text.x = element_text(size = 12, angle = 45, hjust = 1, color = "black", family = "Times New Roman"),
+      axis.text.y = element_text(size = 12, color = "black", family = "Times New Roman"),
+      legend.text = element_text(size = 12, family = "Times New Roman"),
+      legend.title = element_blank(),
+      
+      panel.grid.major.x = element_blank(),  
+      panel.grid.minor.x = element_blank(),  
+      panel.grid.minor.y = element_blank(),
+      panel.background   = element_rect(fill = "grey96", color = NA),
+      panel.border       = element_rect(color = "black", fill = NA, linewidth = 0.6)
+    )
+  
+  plot_list_umi[[i]] <- p
+}
+
+combined_plot_umi <- wrap_plots(plot_list_umi, ncol = 1) +
+  theme(
+    legend.position = "right",
+    text = element_text(family = "Times New Roman")
+  )
+
+combined_plot_umi
+
+ggsave(filename = paste0(wd,"analysis/plot_umi.png"), plot = combined_plot_umi, width = 15, height = 10, dpi = 600, units = "cm")
+```
+
+#Transcriptional Features Distribution (Exon, Intron, Unmapped...)
+```{r}
+plot_pcts <- combined.stats %>%
+  group_by(well_info) %>%
+  summarise(
+    exon_pct       = (sum(Exon) / sum(nReads)) * 100,
+    intron_pct     = (sum(Intron) / sum(nReads)) * 100,
+    unmapped_pct   = (sum(Unmapped) / sum(nReads)) * 100,
+    intergenic_pct = (sum(Intergenic) / sum(nReads)) * 100,
+    ambiguity_pct  = (sum(Ambiguity) / sum(nReads)) * 100,
+    .groups = "drop"
+  )
+
+plot_pcts_long <- plot_pcts %>%
+  pivot_longer(
+    cols = ends_with("_pct"),
+    names_to = "name",
+    values_to = "value"
+  ) %>%
+  mutate(
+    well_info = factor(well_info, levels = c(
+      "D8_cells", "D8_nuclei",
+      "D13_cells", "D13_nuclei",
+      "D15_cells", "D15_nuclei",
+      "D18_cells", "D18_nuclei"
+    )),
+    name = factor(name, 
+                  levels = c("exon_pct", "intron_pct", "intergenic_pct", "ambiguity_pct", "unmapped_pct"),
+                  labels = c("Exon", "Intron", "Intergenic", "Ambiguous", "Unmapped"))
+  )
+
+plot_pct <- ggplot(plot_pcts_long, aes(x = well_info, y = value, fill = name)) +
+  geom_col() +
+  labs(
+    title = "Read composition (%) per sample",
+    x = NULL, 
+    y = "Read Composition %", 
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    text         = element_text(family = "Times New Roman"),
+    plot.title   = element_text(size = 15, family = "Times New Roman", face = "italic"),
+    axis.title   = element_text(size = 12, family = "Times New Roman"),
+    axis.text.x  = element_text(size = 12, angle = 45, hjust = 1, color = "black", family = "Times New Roman"),
+    axis.text.y  = element_text(size = 12, color = "black", family = "Times New Roman"),
+    legend.text  = element_text(size = 12, family = "Times New Roman"),
+    legend.title = element_blank(),
+    
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    panel.background   = element_rect(fill = "grey96", color = NA),
+    panel.border       = element_rect(color = "black", fill = NA, linewidth = 0.6)
+  )
+
+plot_pct
+
+ggsave(filename = paste0(wd,"analysis/plot_pct.png"), plot = plot_pct, width = 32, height = 24, dpi = 600, units = "cm")
+```
+
+```{r}
+combined_final <- combined_plot_umi / plot_pct +
+  plot_layout(heights = c(1, 1)) +  
+  plot_annotation(
+    title = "UMI fraction and Read composition",
+    tag_levels = "A",
+    theme = theme(
+      plot.title = element_text(
+        size = 20, face = "bold", family = "Times New Roman"
+      ),
+      text = element_text(family = "Times New Roman")
+    )
+  )
+
+combined_final
+
+ggsave(filename = paste0(wd,"analysis/plot_combined.png"), plot = combined_final, 
+       width = 22, height = 20, dpi = 600, units = "cm")
+```
+
+#FACS analysis
+```{r}
+wd_FACS <- paste0(wd, "analysis/FACS")
+row_letters <- LETTERS[1:16]
+```
+
+# Define FCS File Paths
+```{r}
+fcs_files <- list(
+  D8  = paste0(wd_FACS, "/D8/organoid_epcam+_11538679.fcs"),
+  D13 = paste0(wd_FACS, "/D13/11538683_EPCAMpos_SYTOXstained2.fcs"),
+  D15 = paste0(wd_FACS, "/D15/plate_11538699.fcs"),
+  D18 = paste0(wd_FACS, "/D18/plate_11538447.fcs")
+)
+
+fcs_files_nuclei <- list(
+  D8  = paste0(wd_FACS, "/D8/kid_org_ATAC_nuclei_11538696.fcs"),
+  D13 = paste0(wd_FACS, "/D13/Kidney_organoid_plain_nuclei_11538297.fcs"),
+  D15 = paste0(wd_FACS, "/D15/kidney organoid c006 nuclei_11538288.fcs"),
+  D18 = paste0(wd_FACS, "/D18/Kidney_organoid_c006_tag_nuclei_11292783.fcs")
+)
+```
+
+# Function to Load FCS Files
+```{r}
+load_fcs_files <- function(file_list) {
+
+  facs_list <- lapply(names(file_list), function(day) {
+
+    fcs <- read.FCS(file_list[[day]], transformation = FALSE)
+    df <- as.data.frame(exprs(fcs))
+
+    df$`XINDEX-C` <- as.integer(df$`XINDEX-C`)
+    df$`YINDEX-C` <- as.integer(df$`YINDEX-C`)
+
+    df <- df[df$`XINDEX-C` > 0 & df$`YINDEX-C` > 0, ]
+
+    df$well <- paste0(
+      row_letters[df$`YINDEX-C`],
+      df$`XINDEX-C`
+    )
+
+    df$day <- day
+    df
+  })
+
+  names(facs_list) <- names(file_list)
+
+  facs_list
+}
+```
+
+# Load Cell and Nuclei FCS Data
+```{r}
+facs_list <- load_fcs_files(fcs_files)
+facs_list_nuclei <- load_fcs_files(fcs_files_nuclei)
+
+sapply(facs_list, function(x) sum(duplicated(x$well)))
+sapply(facs_list_nuclei, function(x) sum(duplicated(x$well)))
+```
+
+# Merge FACS Metadata with Sequencing Statistics
+```{r}
+merge_facs_stats <- function(stats, facs_list){
+
+  stats %>%
+    left_join(
+      bind_rows(facs_list) %>%
+        dplyr::select(well, day, `FSC-A`, `SSC-A`, `FL1-A`, `FL2-A`),
+      by = c("WellID" = "well",
+             "timestamp" = "day")
+    )
+
+}
+```
+
+
+# Create Cell and Nuclei Metadata Tables
+```{r}
+cells.stats <-
+  combined.stats %>%
+  dplyr::filter(sample == "cells") %>%
+  merge_facs_stats(facs_list)
+
+nuclei.stats <-
+  combined.stats %>%
+  dplyr::filter(sample == "nuclei") %>%
+  merge_facs_stats(facs_list_nuclei)
+```
+
+# Function to Generate QC Summary
+```{r}
+generate_qc_summary <- function(stats){
+
+  stats %>%
+    group_by(timestamp) %>%
+    summarise(
+      n_total = n(),
+      n_passed = sum(passed_QC, na.rm = TRUE),
+      pct_passed = round(100*n_passed/n_total,1)
+    )
+
+}
+```
+
+#FACS and QC Plots for Cells
+```{r}
+bind_rows(facs_list) %>%
+  ggplot(aes(x = `FSC-A`, y = `SSC-A`)) +
+  geom_point(alpha = 0.3, size = 0.5) +
+  facet_wrap(~ day) +
+  theme_bw()  +
+  theme(text = element_text(family = "Times New Roman"))
+
+timestamps <- unique(cells.stats$timestamp)
+plot_nreads_FCS <- list()
+for (q in timestamps) {
+  data_fcs <- cells.stats[cells.stats$timestamp == q, ]
+  plot_FCS <- data_fcs %>%
+    ggplot(aes(x = `FSC-A`, y = nReads)) +
+    geom_point(alpha = 0.3, size = 0.5) +
+    scale_y_log10() +
+    ggtitle(paste("Cells -", q)) +
+    theme_bw()  +
+  theme(text = element_text(family = "Times New Roman"))
+  plot_nreads_FCS[[q]] <- plot_FCS
+}
+
+wrap_plots(plot_nreads_FCS, ncol = 2)
+
+
+cells_nreads <- cells.stats %>%
+  ggplot(aes(x = `FSC-A`, y = nReads, color = timestamp)) +
+  geom_point(alpha = 0.6, size = 0.5) +
+  scale_y_log10() +
+  theme_bw() +
+  theme(text = element_text(family = "Times New Roman"))
+
+# Apply QC Thresholds
+cells.stats$passed_QC <- cells.stats$nReads > 10000 & cells.stats$pct_gene > 35
+
+cells_qc_summary <- cells.stats %>%
+  group_by(timestamp) %>%
+  summarise(
+    n_total = n(),
+    n_passed = sum(passed_QC, na.rm = TRUE),
+    pct_passed = round(100 * n_passed / n_total, 1)
+  )
+
+print(cells_nreads)
+cells_qc_summary
+```
+
+```{r}
+cairo_pdf(paste0(wd, "analysis/cells_sorting.pdf"), width = 8, height = 6)
+print(cells_nreads)
+dev.off()
+```
+
+#FACS and QC Plots for Nuclei
+```{r}
+bind_rows(facs_list_nuclei) %>%
+  ggplot(aes(x = `FSC-A`, y = `SSC-A`)) +
+  geom_point(alpha = 0.3, size = 0.5) +
+  facet_wrap(~ day) +
+  theme_bw() +
+  theme(text = element_text(family = "Times New Roman"))
+
+timestamps <- unique(nuclei.stats$timestamp)
+plot_nreads_FCS_nuclei <- list()
+for (q in timestamps) {
+  data_fcs_nuclei <- nuclei.stats[nuclei.stats$timestamp == q, ]
+  
+  plot_FCS_nuclei <- data_fcs_nuclei %>%
+    ggplot(aes(x = `FSC-A`, y = nReads)) +
+    geom_point(alpha = 0.3, size = 0.5) +
+    scale_y_log10() +
+    ggtitle(paste("Nuclei -", q)) +
+    theme_bw() +
+  theme(text = element_text(family = "Times New Roman"))
+  plot_nreads_FCS_nuclei[[q]] <- plot_FCS_nuclei
+}
+
+library(patchwork)
+wrap_plots(plot_nreads_FCS_nuclei, ncol = 2)
+
+
+nuclei_nreads <- nuclei.stats %>%
+  ggplot(aes(x = `FSC-A`, y = nReads, color = timestamp)) +
+  geom_point(alpha = 0.6, size = 0.5) +
+  scale_y_log10() +
+  theme_bw() +
+  theme(text = element_text(family = "Times New Roman"))
+
+nuclei.stats %>%
+  ggplot(aes(x = `SSC-A`, y = nReads, color = timestamp)) +
+  geom_point(alpha = 0.6, size = 0.5) +
+  scale_y_log10() +
+  theme_bw() +
+  theme(text = element_text(family = "Times New Roman"))
+
+nuclei.stats %>%
+  ggplot(aes(x = pct_gene, fill = timestamp)) +
+  geom_histogram(bins = 50, alpha = 0.7) +
+  facet_wrap(~ timestamp) +
+  geom_vline(xintercept = 20, color = "red", linetype = "dashed") +
+  theme_bw() +
+  theme(text = element_text(family = "Times New Roman"))
+
+# Apply QC Thresholds for Nuclei
+nuclei.stats$passed_QC <- nuclei.stats$nReads > 1500 & nuclei.stats$pct_gene > 23
+
+nuclei_qc_list <- nuclei.stats %>%
+  group_by(timestamp) %>%
+  summarise(
+    n_total = n(),
+    n_passed = sum(passed_QC, na.rm = TRUE),
+    pct_passed = round(100 * n_passed / n_total, 1)
+  )
+
+nuclei.stats
+nuclei_qc_list
+```
+
+```{r}
+cairo_pdf(paste0(wd, "analysis/nuclei_sorting.pdf"), width = 8, height = 6)
+print(nuclei_nreads)
+dev.off()
+```
+
+# Function for Back-Gating Analysis
+```{r}
+backgate_analysis <- function(file_list,
+                              stats,
+                              xlim,
+                              ylim,
+                              title) {
+
+  idx_list <- lapply(names(file_list), function(day) {
+
+    fcs <- read.FCS(file_list[[day]], transformation = FALSE)
+    df <- as.data.frame(exprs(fcs))
+
+    df$`XINDEX-C` <- as.integer(df$`XINDEX-C`)
+    df$`YINDEX-C` <- as.integer(df$`YINDEX-C`)
+
+    df$sorted <- df$`XINDEX-C` > 0 &
+                 df$`YINDEX-C` > 0
+
+    df$well <- ifelse(
+      df$sorted,
+      paste0(row_letters[df$`YINDEX-C`], df$`XINDEX-C`),
+      NA
+    )
+
+    df <- left_join(
+      df,
+      stats %>%
+        dplyr::filter(timestamp == day) %>%
+        dplyr::select(WellID, passed_QC),
+      by = c("well" = "WellID")
+    )
+
+    df$category <- case_when(
+      !df$sorted ~ "not sorted",
+      df$passed_QC == TRUE ~ "sorted - passed QC",
+      TRUE ~ "sorted - failed QC"
+    )
+
+    df
+  })
+
+  names(idx_list) <- names(file_list)
+
+  plot_list <- lapply(names(idx_list), function(day) {
+
+    ggplot(idx_list[[day]],
+           aes(`FSC-A`, `SSC-A`)) +
+
+      geom_point(
+        data = subset(idx_list[[day]], category == "not sorted"),
+        color = "grey75",
+        alpha = .3,
+        size = .3
+      ) +
+
+      geom_point(
+        data = subset(idx_list[[day]], category != "not sorted"),
+        aes(color = category),
+        alpha = .8,
+        size = .5
+      ) +
+
+      scale_color_manual(values = c(
+        "sorted - passed QC" = "blue",
+        "sorted - failed QC" = "red"
+      )) +
+
+      coord_cartesian(
+        xlim = xlim,
+        ylim = ylim
+      ) +
+
+      theme_bw() +
+      labs(title = paste(day, title)) +
+      theme(text = element_text(family = "Times New Roman"))
+  })
+
+  names(plot_list) <- names(file_list)
+
+  plot_list
+}
+```
+
+#Back-Gating Analysis for Cells
+```{r}
+plot_list_cells <- backgate_analysis(
+  file_list = fcs_files,
+  stats = cells.stats,
+  xlim = c(0,5e6),
+  ylim = c(0,1e6),
+  title = "cells"
+)
+```
+
+```{r}
+cairo_pdf(paste0(wd, "analysis/FSC_SSC_QC_cells.pdf"), width = 8, height = 6)
+for (q in names(plot_list_cells)) {
+  print(plot_list_cells[[q]])
+}
+  print(cells_nreads)
+dev.off()
+```
+
+#Back-Gating analysis for Nuclei
+```{r}
+plot_list_nuclei <- backgate_analysis(
+  file_list = fcs_files_nuclei,
+  stats = nuclei.stats,
+  xlim = c(0,5e5),
+  ylim = c(0,5e5),
+  title = "nuclei"
+)
+```
+
+```{r}
+cairo_pdf(paste0(wd, "analysis/FSC_SSC_QC_nuclei.pdf"), width = 8, height = 6)
+for (h in names(plot_list_nuclei)) {
+  print(plot_list_nuclei[[h]])
+}
+print(nuclei_nreads)
+dev.off()
+```
+
+```{r}
+combined_backgate <- (plot_list_cells[["D8"]] + plot_list_nuclei[["D8"]] +
+                       plot_list_cells[["D18"]] + plot_list_nuclei[["D18"]]) +
+  plot_layout(ncol = 2, guides = "collect") &
+  theme(
+    legend.position = "right",
+    legend.title = element_blank(),
+    text = element_text(family = "Times New Roman")
+  )
+
+combined_backgate <- combined_backgate +
+  plot_annotation(
+    title = "Back-gating of sequencing QC outcome onto FACS scatter profile",
+    theme = theme(
+      plot.title = element_text(
+        size = 15, face = "bold", family = "Times New Roman"
+      ),
+      text = element_text(family = "Times New Roman")
+    )
+  )
+
+combined_backgate
+
+ggsave(filename = paste0(wd, "analysis/FSC_SSC_QC_D8_D18_combined.png"),
+       plot = combined_backgate, width = 25, height = 21, dpi = 600, units = "cm")
+```
+
+
+
+
+
+
